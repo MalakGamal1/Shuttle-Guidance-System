@@ -1,6 +1,8 @@
 import { initializeApp, getApps, cert, type ServiceAccount } from 'firebase-admin/app'
 import { getMessaging } from 'firebase-admin/messaging'
 import { getAuth } from 'firebase-admin/auth'
+import { getFirestore } from 'firebase-admin/firestore'
+import { NextRequest } from 'next/server'
 
 /**
  * Firebase Admin SDK — runs server-side only (API routes).
@@ -97,4 +99,34 @@ export const adminMessaging = adminApp
             )
         }
     } as unknown as ReturnType<typeof getMessaging>
+
+export async function verifyAdmin(req: NextRequest) {
+    if (!adminAuth || !adminApp) {
+        throw new Error('Firebase Admin SDK is not initialized.')
+    }
+    const authHeader = req.headers.get('Authorization')
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        throw new Error('Unauthorized: Missing or invalid token.')
+    }
+    const token = authHeader.split('Bearer ')[1]
+    const decodedToken = await adminAuth.verifyIdToken(token)
+    
+    // Check if the user is in the admins collection
+    const db = getFirestore(adminApp)
+    const adminDoc = await db.collection('admins').doc(decodedToken.uid).get()
+    if (!adminDoc.exists) {
+        throw new Error('Unauthorized: Admin access required.')
+    }
+    
+    const adminData = adminDoc.data()
+    if (adminData?.suspended === true) {
+        throw new Error('Unauthorized: Admin account is suspended.')
+    }
+
+    return {
+        uid: decodedToken.uid,
+        email: decodedToken.email,
+        role: adminData?.role || 'admin',
+    }
+}
 

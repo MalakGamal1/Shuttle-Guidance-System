@@ -326,7 +326,7 @@ function DriverFormFields({
 // ── Page ───────────────────────────────────────────────────────────────────────
 
 export default function DriversPage() {
-  const { role } = useAuth()
+  const { role, user } = useAuth()
   const canManage = role === 'admin' || role === 'root'
 
   const [drivers, setDrivers] = useState<Driver[]>([])
@@ -461,9 +461,13 @@ export default function DriversPage() {
       const assignedShuttle = shuttles.find((s) => s.id === addForm.vehicleAssigned)
       const isActive = assignedShuttle?.status === 'maintenance' ? false : addForm.isActive
 
+      const token = await user?.getIdToken()
       const res = await fetch('/api/drivers', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({
           fullName: addForm.name.trim(),
           email: addForm.email.trim(),
@@ -527,9 +531,13 @@ export default function DriversPage() {
       // Use uid if available, otherwise fall back to doc id
       const driverUid = editingDriver.uid || editingDriver.id
 
+      const token = await user?.getIdToken()
       const res = await fetch('/api/drivers/update', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({
           uid: driverUid,
           fullName: editForm.name.trim(),
@@ -583,9 +591,13 @@ export default function DriversPage() {
     setIsSaving(true)
     try {
       const driverUid = resetPwDriver.uid || resetPwDriver.id
+      const token = await user?.getIdToken()
       const res = await fetch('/api/drivers/reset-password', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({ uid: driverUid, newPassword }),
       })
       const data = await res.json()
@@ -610,9 +622,13 @@ export default function DriversPage() {
     try {
       const driverUid = driver.uid || driver.id
 
+      const token = await user?.getIdToken()
       const res = await fetch('/api/drivers/delete', {
         method: 'DELETE',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({ uid: driverUid }),
       })
 
@@ -820,15 +836,17 @@ export default function DriversPage() {
                         </td>
                         <td className="py-3">
                           <div className="flex items-center justify-center gap-1">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => handleOpenEdit(driver)}
-                              className="hover:bg-blue-500/10 text-blue-500 hover:text-blue-600"
-                              title="Edit driver"
-                            >
-                              <Edit2 className="h-4 w-4" />
-                            </Button>
+                            {canManage && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => handleOpenEdit(driver)}
+                                className="hover:bg-blue-500/10 text-blue-500 hover:text-blue-600"
+                                title="Edit driver"
+                              >
+                                <Edit2 className="h-4 w-4" />
+                              </Button>
+                            )}
                             {canManage && (
                               <Button
                                 variant="ghost"
@@ -840,15 +858,17 @@ export default function DriversPage() {
                                 <KeyRound className="h-4 w-4" />
                               </Button>
                             )}
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => handleDelete(driver)}
-                              className="hover:bg-red-500/10 text-red-500 hover:text-red-600"
-                              title="Delete driver"
-                            >
-                              <Trash2 className="h-4 w-4" />
-                            </Button>
+                            {canManage && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => handleDelete(driver)}
+                                className="hover:bg-red-500/10 text-red-500 hover:text-red-600"
+                                title="Delete driver"
+                              >
+                                <Trash2 className="h-4 w-4" />
+                              </Button>
+                            )}
                           </div>
                         </td>
                       </tr>

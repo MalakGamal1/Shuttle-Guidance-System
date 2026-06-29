@@ -194,27 +194,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
               sessionValid: true,
               lastActiveAt: serverTimestamp(),
             }, { merge: true })
+
+            // Check Verification Status
+            const isVerified = userProfile.emailVerified === true || firebaseUser.emailVerified;
+
+            if (!isVerified) {
+              if (!isPublicRoute) {
+                router.push('/verify')
+              }
+            }
+
+            setProfile(userProfile)
+            setRole(userProfile.role)
+            setUser(firebaseUser)
           } else {
-            userProfile = defaults
-            await setDoc(profileDocRef, {
-              ...userProfile,
-              sessionValid: true,
-              lastActiveAt: serverTimestamp(),
-            }, { merge: true })
-          }
-
-          // Check Verification Status
-          const isVerified = userProfile.emailVerified === true || firebaseUser.emailVerified;
-
-          if (!isVerified) {
+            console.warn('[Auth] No admin profile found. Forcing sign out.')
+            await signOut(auth)
+            setUser(null)
+            setProfile(null)
+            setRole(null)
+            setError('Unauthorized: Admin access required.')
             if (!isPublicRoute) {
-              router.push('/verify')
+              router.push('/login')
             }
           }
-
-          setProfile(userProfile)
-          setRole(userProfile.role)
-          setUser(firebaseUser)
         } else {
           // Session expired or user signed out
           const prevUser = userRef.current

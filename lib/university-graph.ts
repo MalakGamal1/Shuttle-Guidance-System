@@ -1,11 +1,4 @@
-import { db } from './firebase'
-import { collection, getDocs } from 'firebase/firestore'
-
-/**
- * university-graph.ts
- * Coordinates from OpenStreetMap — Assiut University
- * Rebuilt dynamically at runtime from Firestore.
- */
+import campusRoads from './campus-roads.json'
 
 export interface Station {
   id: string
@@ -16,641 +9,636 @@ export interface Station {
 
 export interface GraphNode {
   id: string
-  x: number  // lng
-  y: number  // lat
+  x: number
+  y: number
 }
 
 export interface GraphEdge {
   from: string
   to: string
-  cost: number  // meters approx
+  cost: number
+  featureIdx: number
 }
 
-export const STATIONS: Station[] = []
-export const NODES: GraphNode[] = []
-export const EDGES: GraphEdge[] = []
+const SNAP_METERS = 2
 
-export const HELPER_NODES: Station[] = [
+interface GeoJSONFeature {
+  type: string
+  properties: Record<string, unknown>
+  geometry: {
+    type: string
+    coordinates: number[][] | number[]
+  }
+}
+
+interface GeoJSONData {
+  type: string
+  features: GeoJSONFeature[]
+}
+
+export function getHaversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371e3
+  const φ1 = (lat1 * Math.PI) / 180
+  const φ2 = (lat2 * Math.PI) / 180
+  const Δφ = ((lat2 - lat1) * Math.PI) / 180
+  const Δλ = ((lon2 - lon1) * Math.PI) / 180
+  const a = Math.sin(Δφ / 2) ** 2 + Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) ** 2
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
+}
+
+type AdjList = Record<string, string[]>
+
+function findConnectedComponents(adj: AdjList, allIds: string[]): string[][] {
+  const visited = new Set<string>()
+  const components: string[][] = []
+
+  for (const id of allIds) {
+    if (visited.has(id)) continue
+    const component: string[] = []
+    const stack = [id]
+    while (stack.length > 0) {
+      const cur = stack.pop()!
+      if (visited.has(cur)) continue
+      visited.add(cur)
+      component.push(cur)
+      for (const nb of adj[cur] || []) {
+        if (!visited.has(nb)) stack.push(nb)
+      }
+    }
+    components.push(component)
+  }
+  return components
+}
+
+function buildGraph() {
+  const data = campusRoads as unknown as GeoJSONData
+  const nodeMap = new Map<string, { lat: number; lng: number }>()
+  const edgeSet = new Set<string>()
+  const edgeMeta = new Map<string, { originalFrom?: string; originalTo?: string; featureIdx: number }>()
+  const nodeToFeatures: Map<string, Set<number>> = new Map()
+  let lineStringsLoaded = 0
+  let mergedCount = 0
+
+  // Collect all GeoJSON coordinates for validation
+  const allGeoCoords: string[] = []
+
+  // Grid spatial index: cell ≈ 2.2m at lat 27° (1/50000 deg)
+  const grid = new Map<string, string>()
+
+  function gridKey(lat: number, lng: number): string {
+    return `${Math.round(lat * 50000)}_${Math.round(lng * 50000)}`
+  }
+
+  function findOrCreateNode(lat: number, lng: number): string {
+    const key = gridKey(lat, lng)
+
+    if (grid.has(key)) {
+      const nodeId = grid.get(key)!
+      const existing = nodeMap.get(nodeId)!
+      if (getHaversineDistance(existing.lat, existing.lng, lat, lng) < SNAP_METERS) {
+        mergedCount++
+        return nodeId
+      }
+    }
+
+    const parts = key.split('_').map(Number)
+    const rLat = parts[0]
+    const rLng = parts[1]
+
+    for (let dl = -1; dl <= 1; dl++) {
+      for (let dg = -1; dg <= 1; dg++) {
+        if (dl === 0 && dg === 0) continue
+        const nk = `${rLat + dl}_${rLng + dg}`
+        if (grid.has(nk)) {
+          const nodeId = grid.get(nk)!
+          const existing = nodeMap.get(nodeId)!
+          if (getHaversineDistance(existing.lat, existing.lng, lat, lng) < SNAP_METERS) {
+            mergedCount++
+            return nodeId
+          }
+        }
+      }
+    }
+
+    const id = `n_${nodeMap.size}`
+    nodeMap.set(id, { lat, lng })
+    grid.set(key, id)
+    return id
+  }
+
+  data.features.forEach((feature, featureIdx) => {
+    if (feature.geometry.type !== 'LineString') return
+    const coords = feature.geometry.coordinates as number[][]
+    if (coords.length < 2) return
+    lineStringsLoaded++
+
+    coords.forEach(([lng, lat]) => {
+      allGeoCoords.push(`${lat},${lng}`)
+    })
+
+    const nodeIds: string[] = []
+    coords.forEach(([lng, lat]) => {
+      const nid = findOrCreateNode(lat as number, lng as number)
+      nodeIds.push(nid)
+      if (!nodeToFeatures.has(nid)) nodeToFeatures.set(nid, new Set())
+      nodeToFeatures.get(nid)!.add(featureIdx)
+    })
+
+    for (let i = 0; i < nodeIds.length - 1; i++) {
+      const id1 = nodeIds[i]
+      const id2 = nodeIds[i + 1]
+      if (id1 === id2) continue
+      const key = id1 < id2 ? `${id1}-${id2}` : `${id2}-${id1}`
+      edgeSet.add(key)
+      edgeMeta.set(key, { originalFrom: id1, originalTo: id2, featureIdx })
+    }
+  })
+
+  const nodes: GraphNode[] = []
+  const nodeCoords: Record<string, { lat: number; lng: number }> = {}
+
+  nodeMap.forEach((coords, id) => {
+    nodes.push({ id, x: coords.lng, y: coords.lat })
+    nodeCoords[id] = coords
+  })
+
+  let edges: GraphEdge[] = []
+  edgeSet.forEach(key => {
+    const [id1, id2] = key.split('-')
+    const c1 = nodeMap.get(id1)
+    const c2 = nodeMap.get(id2)
+    if (!c1 || !c2) return
+    const cost = Math.round(getHaversineDistance(c1.lat, c1.lng, c2.lat, c2.lng))
+    const meta = edgeMeta.get(key)
+    edges.push({ from: meta?.originalFrom || id1, to: meta?.originalTo || id2, cost, featureIdx: meta?.featureIdx ?? -1 })
+  })
+
+  // ── Junction Detection & Road Splitting ──
+  let junctionsDetected = 0
+  let roadsSplit = 0
+
+  const splitsByEdge = new Map<string, Array<{
+    nodeId: string; projLat: number; projLng: number; t: number
+  }>>()
+
+  edgeSet.forEach(edgeKey => {
+    const [idA, idB] = edgeKey.split('-')
+    const cA = nodeMap.get(idA)
+    const cB = nodeMap.get(idB)
+    if (!cA || !cB) return
+
+    for (const [nodeId, coord] of Object.entries(nodeCoords)) {
+      if (nodeId === idA || nodeId === idB) continue
+
+      const proj = projectPointOnSegment(coord.lat, coord.lng, cA.lat, cA.lng, cB.lat, cB.lng)
+      if (proj.distance < 2 && proj.t > 0.05 && proj.t < 0.95) {
+        if (!splitsByEdge.has(edgeKey)) splitsByEdge.set(edgeKey, [])
+        splitsByEdge.get(edgeKey)!.push({
+          nodeId, projLat: proj.lat, projLng: proj.lng, t: proj.t,
+        })
+      }
+    }
+  })
+
+  if (splitsByEdge.size > 0) {
+    splitsByEdge.forEach((splits, edgeKey) => {
+      splits.sort((a, b) => a.t - b.t)
+
+      const [idA, idB] = edgeKey.split('-')
+
+        const parentMeta = edgeMeta.get(edgeKey)
+        const parentFeatureIdx = parentMeta?.featureIdx ?? -1
+
+        // Remove original edge
+        edgeSet.delete(edgeKey)
+
+        let prevId = idA
+        splits.forEach(split => {
+          const junctionId = `j_${junctionsDetected}`
+          junctionsDetected++
+
+          nodeMap.set(junctionId, { lat: split.projLat, lng: split.projLng })
+
+          // Edge from prev to junction (inherits parent featureIdx)
+          const ek1 = prevId < junctionId ? `${prevId}-${junctionId}` : `${junctionId}-${prevId}`
+          edgeSet.add(ek1)
+          edgeMeta.set(ek1, { originalFrom: prevId, originalTo: junctionId, featureIdx: parentFeatureIdx })
+
+          // Edge from junction to crossing road node (bidirectional — no feature)
+          const ek2 = junctionId < split.nodeId ? `${junctionId}-${split.nodeId}` : `${split.nodeId}-${junctionId}`
+          edgeSet.add(ek2)
+          edgeMeta.set(ek2, { originalFrom: junctionId, originalTo: split.nodeId, featureIdx: -1 })
+
+          roadsSplit++
+          prevId = junctionId
+        })
+
+        // Final edge from last junction to idB (inherits parent featureIdx)
+        const ekLast = prevId < idB ? `${prevId}-${idB}` : `${idB}-${prevId}`
+        edgeSet.add(ekLast)
+        edgeMeta.set(ekLast, { originalFrom: prevId, originalTo: idB, featureIdx: parentFeatureIdx })
+    })
+
+    // Rebuild nodes and nodeCoords from updated nodeMap
+    nodes.length = 0
+    for (const key of Object.keys(nodeCoords)) delete nodeCoords[key]
+    nodeMap.forEach((coords, id) => {
+      nodes.push({ id, x: coords.lng, y: coords.lat })
+      nodeCoords[id] = coords
+    })
+
+    // Rebuild edges from updated edgeSet (preserve original direction and featureIdx)
+    edges = []
+    edgeSet.forEach(key => {
+      const [id1, id2] = key.split('-')
+      const c1 = nodeMap.get(id1)
+      const c2 = nodeMap.get(id2)
+      if (!c1 || !c2) return
+      const cost = Math.round(getHaversineDistance(c1.lat, c1.lng, c2.lat, c2.lng))
+      const meta = edgeMeta.get(key)
+    edges.push({ from: meta?.originalFrom || id1, to: meta?.originalTo || id2, cost, featureIdx: meta?.featureIdx ?? -1 })
+    })
+  }
+
+  console.log(`[CampusGraph] Junctions Detected — ${junctionsDetected}`)
+  console.log(`[CampusGraph] Roads Split — ${roadsSplit}`)
+
+  // Build undirected adjacency
+  const adj: AdjList = {}
+  nodes.forEach(n => { adj[n.id] = [] })
+  edges.forEach(e => {
+    adj[e.from].push(e.to)
+    adj[e.to].push(e.from)
+  })
+
+  console.log(`[CampusGraph] Nodes created: ${nodes.length}`)
+  console.log(`[CampusGraph] Edges created: ${edges.length}`)
+
+  // Edge lookup set for validation
+  const edgeLookup = new Set<string>(edgeSet)
+
+  // Find connected components
+  let components = findConnectedComponents(adj, nodes.map(n => n.id))
+
+  console.log(`[CampusGraph] LineStrings loaded — ${lineStringsLoaded}`)
+  console.log(`[CampusGraph] Nodes created — ${nodes.length}`)
+  console.log(`[CampusGraph] Edges created — ${edges.length}`)
+  console.log(`[CampusGraph] Merged coordinates — ${mergedCount}`)
+  console.log(`[CampusGraph] Connected Components — ${components.length}`)
+  components.forEach((comp, i) => {
+    console.log(`[CampusGraph]   Component ${i + 1}: ${comp.length} nodes`)
+  })
+
+  // Bridge disconnected components by connecting nearest endpoints
+  if (components.length > 1) {
+    console.log(`[CampusGraph] Bridging ${components.length} components...`)
+    let bridgeCount = 0
+    while (components.length > 1) {
+      let minDist = Infinity
+      let minA = ''
+      let minB = ''
+      let compI = -1
+      let compJ = -1
+
+      for (let i = 0; i < components.length; i++) {
+        for (let j = i + 1; j < components.length; j++) {
+          for (const idA of components[i]) {
+            const cA = nodeMap.get(idA)!
+            for (const idB of components[j]) {
+              const cB = nodeMap.get(idB)!
+              const dist = getHaversineDistance(cA.lat, cA.lng, cB.lat, cB.lng)
+              if (dist < minDist) {
+                minDist = dist
+                minA = idA
+                minB = idB
+                compI = i
+                compJ = j
+              }
+            }
+          }
+        }
+      }
+
+      if (minDist === Infinity || minDist > 50) {
+        console.log(`[CampusGraph] Cannot bridge — closest pair ${Math.round(minDist)}m, aborting`)
+        break
+      }
+
+      const key = minA < minB ? `${minA}-${minB}` : `${minB}-${minA}`
+      if (!edgeLookup.has(key)) {
+        edgeSet.add(key)
+        const cost = Math.round(minDist)
+        edges.push({ from: minA, to: minB, cost, featureIdx: -1 })
+        adj[minA].push(minB)
+        adj[minB].push(minA)
+        edgeLookup.add(key)
+        bridgeCount++
+        console.log(`[CampusGraph]   Bridge ${bridgeCount}: ${minA} <-> ${minB} (${Math.round(minDist)}m)`)
+      }
+
+      // Merge component i and j
+      const merged = [...components[compI], ...components[compJ]]
+      if (compI < compJ) {
+        components.splice(compJ, 1)
+        components.splice(compI, 1)
+      } else {
+        components.splice(compI, 1)
+        components.splice(compJ, 1)
+      }
+      components.push(merged)
+    }
+
+    // Re-check connectivity
+    components = findConnectedComponents(adj, nodes.map(n => n.id))
+    console.log(`[CampusGraph] After bridging:`)
+    console.log(`[CampusGraph]   Bridges added — ${bridgeCount}`)
+    console.log(`[CampusGraph]   Connected Components — ${components.length}`)
+    components.forEach((comp, i) => {
+      console.log(`[CampusGraph]   Component ${i + 1}: ${comp.length} nodes`)
+    })
+  }
+
+  // Build coordinate set for validation (all GeoJSON LineString coords)
+  const geoCoordSet = new Set<string>(allGeoCoords)
+
+  return { nodes, edges, nodeCoords, edgeLookup, adj, components, geoCoordSet, junctionsDetected, roadsSplit, nodeToFeatures }
+}
+
+const { nodes: _NODES, edges: _EDGES, nodeCoords, edgeLookup, adj, components: _COMPONENTS, geoCoordSet, nodeToFeatures: _NODE_TO_FEATURES } = buildGraph()
+
+export const NODES = _NODES
+export const EDGES = _EDGES
+export const NODE_COORDS = nodeCoords
+export const EDGE_LOOKUP = edgeLookup
+export const ADJ = adj
+export const COMPONENTS = _COMPONENTS
+export const GEO_COORD_SET = geoCoordSet
+export const NODE_TO_FEATURES = _NODE_TO_FEATURES
+
+console.log(`[ROUTING]
+mode=shortest_path_only
+directions=disabled
+turn_restrictions=disabled
+roads_source=campus-roads.geojson`)
+
+export const STATIONS: Station[] = [
+  { id: 'f4ukuh8Dxxtv4l0KM7hH', name: 'بوابة الصيانة', lat: 27.184440, lng: 31.168520 },
+  { id: 'jZtWXtuPx0zd5hR791HE', name: 'بوابة الجامعة الرئيسية', lat: 27.186347, lng: 31.174880 },
+  { id: 'V4zxq08WnmvS8KlivfdG', name: 'بوابة الترعة', lat: 27.191397, lng: 31.173000 },
+  { id: 'c5XobcRdrUYlnC1P6RQF', name: 'بوابة مستشفى الجامعة', lat: 27.186881, lng: 31.166300 },
+  { id: 'JYYrtbsIlz9v8Vq3QzKc', name: 'كلية الزراعة', lat: 27.188350, lng: 31.168949 },
+  { id: 'hhshQzvx6JBtyN2XOWrQ', name: 'كلية التربية الرياضية', lat: 27.188500, lng: 31.166495 },
+  { id: 'ppo8pfwkoqe9I7W6dh8G', name: 'ملعب جامعة أسيوط', lat: 27.188874, lng: 31.174286 },
+  { id: 'f6hwuB5XCNMoiXFR0kNE', name: 'كلية العلوم', lat: 27.188950, lng: 31.171300 },
+  { id: 'AzqlIx99BldHQwZN6hcN', name: 'كلية الصيدلة', lat: 27.188180, lng: 31.165757 },
+  { id: 'thOOMFdu8483n9YOKy2A', name: 'كلية الطب', lat: 27.187162, lng: 31.167650 },
+  { id: '0sbuAScZzG7Dbiu6xBSU', name: 'كلية الحاسبات (FCI)', lat: 27.186198, lng: 31.168162 },
+  { id: 'x0miqk0qUs1k64fqxnuf', name: 'كلية طب الأسنان', lat: 27.186960, lng: 31.169494 },
+  { id: 'Z3GODIJdkw4OGwgevOJh', name: 'كلية التربية', lat: 27.189405, lng: 31.172900 },
+  { id: 'wV6eQZXbZyM7ze2J5xkX', name: 'كلية الحقوق والتجارة', lat: 27.187958, lng: 31.173506 },
+  { id: 's94mttXqsdLjzAyIqnLE', name: 'كلية الهندسة', lat: 27.187630, lng: 31.172300 },
+  { id: 'sciqfxN1U34f7s0XE3Zg', name: 'المدينة الجامعية (أ)', lat: 27.187850, lng: 31.178294 },
+  { id: 'wNPichJG4cHmJSM5jRr0', name: 'المدينة الجامعية (د)', lat: 27.188250, lng: 31.175300 },
   { id: 'guest_house', name: 'دار الضيافة', lat: 27.185200, lng: 31.170000 },
   { id: 'roundabout', name: 'الميدان الرئيسي', lat: 27.186500, lng: 31.171000 },
   { id: 'surgery', name: 'مبنى الجراحة', lat: 27.187200, lng: 31.173000 },
   { id: 'hospital', name: 'المستشفى الرئيسي', lat: 27.187000, lng: 31.165000 },
 ]
 
-export interface EdgeConfig {
-  from: string
-  to: string
-  cost: number
-}
-
-export const EDGES_CONFIG: EdgeConfig[] = [
-  // Gates → nearest stops
-  { from: 'بوابة مستشفى الجامعة', to: 'hospital', cost: 150 },
-  { from: 'بوابة مستشفى الجامعة', to: 'كلية العلوم', cost: 200 },
-  { from: 'بوابة مستشفى الجامعة', to: 'كلية الصيدلة', cost: 220 },
-
-  { from: 'بوابة الصيانة', to: 'كلية الطب', cost: 180 },
-  { from: 'بوابة الصيانة', to: 'guest_house', cost: 200 },
-
-  { from: 'بوابة الجامعة الرئيسية', to: 'كلية طب الأسنان', cost: 150 },
-  { from: 'بوابة الجامعة الرئيسية', to: 'المدينة الجامعية (أ)', cost: 280 },
-
-  { from: 'بوابة الترعة', to: 'كلية الزراعة', cost: 180 },
-  { from: 'بوابة الترعة', to: 'ملعب جامعة أسيوط', cost: 220 },
-  { from: 'بوابة الترعة', to: 'كلية التربية', cost: 280 },
-
-  // North axis
-  { from: 'كلية التربية الرياضية', to: 'كلية الزراعة', cost: 250 },
-  { from: 'كلية التربية الرياضية', to: 'كلية الصيدلة', cost: 180 },
-  { from: 'كلية الزراعة', to: 'كلية العلوم', cost: 240 },
-  { from: 'كلية العلوم', to: 'ملعب جامعة أسيوط', cost: 290 },
-  { from: 'كلية الزراعة', to: 'كلية التربية', cost: 200 },
-  { from: 'كلية التربية', to: 'ملعب جامعة أسيوط', cost: 350 },
-  { from: 'كلية التربية', to: 'كلية الهندسة', cost: 200 },
-  { from: 'ملعب جامعة أسيوط', to: 'بوابة الجامعة الرئيسية', cost: 280 },
-
-  // West vertical axis
-  { from: 'كلية العلوم', to: 'كلية الصيدلة', cost: 120 },
-  { from: 'كلية الصيدلة', to: 'كلية الطب', cost: 180 },
-  { from: 'كلية الطب', to: 'guest_house', cost: 160 },
-  { from: 'guest_house', to: 'كلية الحقوق و التجارة', cost: 180 },
-  { from: 'كلية الحقوق و التجارة', to: 'كلية الهندسة', cost: 160 },
-
-  // Central roundabout hub
-  { from: 'roundabout', to: 'كلية العلوم', cost: 320 },
-  { from: 'roundabout', to: 'كلية التربية', cost: 250 },
-  { from: 'roundabout', to: 'guest_house', cost: 160 },
-  { from: 'roundabout', to: 'surgery', cost: 200 },
-  { from: 'roundabout', to: 'كلية الحاسبات و المعلومات', cost: 150 },
-  { from: 'surgery', to: 'ملعب جامعة أسيوط', cost: 350 },
-
-  // East axis
-  { from: 'كلية الحاسبات و المعلومات', to: 'كلية طب الأسنان', cost: 180 },
-  { from: 'كلية الحاسبات و المعلومات', to: 'كلية الحقوق و التجارة', cost: 200 },
-  { from: 'كلية طب الأسنان', to: 'surgery', cost: 200 },
-  { from: 'كلية طب الأسنان', to: 'المدينة الجامعية (أ)', cost: 220 },
-
-  // Dorms
-  { from: 'المدينة الجامعية (أ)', to: 'المدينة الجامعية (د)', cost: 200 },
-  { from: 'المدينة الجامعية (أ)', to: 'كلية الهندسة', cost: 380 },
-  { from: 'المدينة الجامعية (د)', to: 'كلية الهندسة', cost: 450 },
-]
-
-export function buildGraph(firestoreStations: any[]) {
-  STATIONS.length = 0
-  NODES.length = 0
-  EDGES.length = 0
-
-  // 1. Re-populate STATIONS with all Firestore stations
-  firestoreStations.forEach((fs) => {
-    if (typeof fs.lat === 'number' && typeof fs.lng === 'number') {
-      STATIONS.push({
-        id: fs.id,
-        name: fs.name,
-        lat: fs.lat,
-        lng: fs.lng,
-      })
-    }
-  })
-
-  // 2. Add intermediate helper nodes
-  HELPER_NODES.forEach((helper) => {
-    STATIONS.push(helper)
-  })
-
-  // 3. Rebuild NODES mapping
-  STATIONS.forEach((s) => {
-    NODES.push({
-      id: s.id,
-      x: s.lng,
-      y: s.lat,
-    })
-  })
-
-  // 4. Create name-to-ID lookup map
-  const nameToId: Record<string, string> = {}
-  STATIONS.forEach((s) => {
-    nameToId[s.name] = s.id
-    nameToId[s.id] = s.id // helper nodes map ID to ID
-  })
-
-  // 5. Translate name-based EDGES_CONFIG to ID-based EDGES
-  EDGES_CONFIG.forEach((edge) => {
-    const fromId = nameToId[edge.from]
-    const toId = nameToId[edge.to]
-    if (fromId && toId) {
-      EDGES.push({
-        from: fromId,
-        to: toId,
-        cost: edge.cost,
-      })
-    } else {
-      console.warn(`[buildGraph] Could not resolve edge from '${edge.from}' to '${edge.to}'`)
-    }
-  })
-
-  // 6. Connect any newly created stations (unconnected) to their nearest node
-  const connectedIds = new Set<string>()
-  EDGES.forEach((e) => {
-    connectedIds.add(e.from)
-    connectedIds.add(e.to)
-  })
-
-  const unconnectedStations = firestoreStations.filter(
-    (fs) => fs.id && !connectedIds.has(fs.id) && typeof fs.lat === 'number' && typeof fs.lng === 'number'
-  )
-
-  unconnectedStations.forEach((station) => {
-    let nearestNode: GraphNode | null = null
-    let minDistance = Infinity
-
-    for (const node of NODES) {
-      if (node.id === station.id) continue // skip itself
-      const dist = getHaversineDistance(station.lat, station.lng, node.y, node.x)
-      if (dist < minDistance) {
-        minDistance = dist
-        nearestNode = node
-      }
-    }
-
-    if (nearestNode) {
-      const cost = Math.round(minDistance)
-      // Bidirectional edge
-      EDGES.push({
-        from: station.id,
-        to: (nearestNode as GraphNode).id,
-        cost: cost,
-      })
-      console.log(`[buildGraph] Dynamically connected new station '${station.name}' (${station.id}) to nearest node '${(nearestNode as GraphNode).id}' (distance: ${cost}m)`)
-    }
-  })
-
-  console.log(`[buildGraph] Graph built: ${STATIONS.length} stations, ${EDGES.length} edges`)
-}
-
-export async function syncGraphWithFirestore() {
-  try {
-    const snapshot = await getDocs(collection(db, 'stations'))
-    const stations = snapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-    }))
-    buildGraph(stations)
-    console.log(`[syncGraphWithFirestore] Synced ${stations.length} stations from Firestore. Graph successfully rebuilt.`)
-  } catch (err) {
-    console.error(`[syncGraphWithFirestore] Error loading stations from Firestore:`, err)
-  }
-}
-
+export const LARGEST_COMPONENT = _COMPONENTS.reduce((max, c) => c.length > max.length ? c : max, _COMPONENTS[0])
 
 export function getNearestNode(lat: number, lng: number): GraphNode {
-  let nearestNode = NODES[0]
-  let minDistance = Infinity
-
-  NODES.forEach((node) => {
-    const dist = getHaversineDistance(lat, lng, node.y, node.x)
-    if (dist < minDistance) {
-      minDistance = dist
-      nearestNode = node
+  let nearest = NODES[0]
+  let minDist = Infinity
+  NODES.forEach(n => {
+    const dx = n.x - lng
+    const dy = n.y - lat
+    const d = dx * dx + dy * dy
+    if (d < minDist) {
+      minDist = d
+      nearest = n
     }
   })
-
-  return nearestNode
+  return nearest
 }
 
-// Haversine distance in meters
-export function getHaversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number {
-  const R = 6371e3 // Earth radius in meters
-  const φ1 = (lat1 * Math.PI) / 180
-  const φ2 = (lat2 * Math.PI) / 180
-  const Δφ = ((lat2 - lat1) * Math.PI) / 180
-  const Δλ = ((lon2 - lon1) * Math.PI) / 180
-
-  const a =
-    Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2)
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a))
-
-  return R * c
+export function getNearestStation(stationId: string): GraphNode | null {
+  const station = STATIONS.find(s => s.id === stationId)
+  if (!station) return null
+  return getNearestNode(station.lat, station.lng)
 }
 
 export function aStar(startId: string, goalId: string): { path: string[]; cost: number } {
-  if (startId === goalId) {
-    if (!NODES.some(n => n.id === startId)) {
-      console.warn(`[aStar] Path contains missing node ID: ${startId}`)
-    }
-    return { path: [startId], cost: 0 }
-  }
+  if (startId === goalId) return { path: [startId], cost: 0 }
 
   const goalNode = NODES.find(n => n.id === goalId)
   if (!goalNode) return { path: [], cost: Infinity }
 
   const openSet = new Set<string>([startId])
   const cameFrom: Record<string, string> = {}
-  
   const gScore: Record<string, number> = {}
-  NODES.forEach(n => (gScore[n.id] = Infinity))
+  const fScore: Record<string, number> = {}
+
+  NODES.forEach(n => { gScore[n.id] = Infinity; fScore[n.id] = Infinity })
   gScore[startId] = 0
 
-  const fScore: Record<string, number> = {}
-  NODES.forEach(n => (fScore[n.id] = Infinity))
-  
   const startNode = NODES.find(n => n.id === startId)
   if (!startNode) return { path: [], cost: Infinity }
   fScore[startId] = getHaversineDistance(startNode.y, startNode.x, goalNode.y, goalNode.x)
 
-  const adj: Record<string, { to: string; cost: number }[]> = {}
-  NODES.forEach((n) => { adj[n.id] = [] })
-
-  EDGES.forEach((e) => {
-    if (adj[e.from] && adj[e.to]) {
-      adj[e.from].push({ to: e.to, cost: e.cost })
-      adj[e.to].push({ to: e.from, cost: e.cost })
-    }
-  })
-
   while (openSet.size > 0) {
     let currentId = ''
-    let minFScore = Infinity
-
-    openSet.forEach(nodeId => {
-      if (fScore[nodeId] < minFScore) {
-        minFScore = fScore[nodeId]
-        currentId = nodeId
-      }
+    let minF = Infinity
+    openSet.forEach(id => {
+      if (fScore[id] < minF) { minF = fScore[id]; currentId = id }
     })
-
     if (currentId === goalId) {
       const path: string[] = []
-      let curr = currentId
-      while (cameFrom[curr]) {
-        path.unshift(curr)
-        curr = cameFrom[curr]
-      }
+      let cur = currentId
+      while (cameFrom[cur]) { path.unshift(cur); cur = cameFrom[cur] }
       path.unshift(startId)
-
-      // Verify all node IDs in the path exist in NODES
-      path.forEach(nodeId => {
-        if (!NODES.some(n => n.id === nodeId)) {
-          console.warn(`[aStar] Path contains missing node ID: ${nodeId}`)
-        }
-      })
-
       return { path, cost: gScore[goalId] }
     }
-
     openSet.delete(currentId)
-
-    const neighbors = adj[currentId] || []
-    for (const neighbor of neighbors) {
-      const tentativeGScore = gScore[currentId] + neighbor.cost
-
-      if (tentativeGScore < gScore[neighbor.to]) {
-        cameFrom[neighbor.to] = currentId
-        gScore[neighbor.to] = tentativeGScore
-        
-        const neighborNode = NODES.find(n => n.id === neighbor.to)
-        if (neighborNode) {
-          fScore[neighbor.to] = tentativeGScore + getHaversineDistance(neighborNode.y, neighborNode.x, goalNode.y, goalNode.x)
-          openSet.add(neighbor.to)
+    for (const nb of adj[currentId] || []) {
+      const edgeCost = getEdgeCost(currentId, nb)
+      if (edgeCost === Infinity) continue
+      const tg = gScore[currentId] + edgeCost
+      if (tg < gScore[nb]) {
+        cameFrom[nb] = currentId
+        gScore[nb] = tg
+        const nn = NODES.find(n => n.id === nb)
+        if (nn) {
+          fScore[nb] = tg + getHaversineDistance(nn.y, nn.x, goalNode.y, goalNode.x)
+          openSet.add(nb)
         }
       }
     }
   }
-
   return { path: [], cost: Infinity }
 }
 
-function getPermutations<T>(arr: T[]): T[][] {
-  const results: T[][] = []
-  function permute(temp: T[], remaining: T[]) {
-    if (remaining.length === 0) {
-      results.push(temp)
-      return
-    }
-    for (let i = 0; i < remaining.length; i++) {
-      permute([...temp, remaining[i]], [...remaining.slice(0, i), ...remaining.slice(i + 1)])
+function getEdgeCost(idA: string, idB: string): number {
+  const key = idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`
+  const edge = EDGES.find(e => {
+    const ek = e.from < e.to ? `${e.from}-${e.to}` : `${e.to}-${e.from}`
+    return ek === key
+  })
+  return edge ? edge.cost : Infinity
+}
+
+export function getEdgeFeatureIdx(idA: string, idB: string): number {
+  const key = idA < idB ? `${idA}-${idB}` : `${idB}-${idA}`
+  const edge = EDGES.find(e => {
+    const ek = e.from < e.to ? `${e.from}-${e.to}` : `${e.to}-${e.from}`
+    return ek === key
+  })
+  return edge ? edge.featureIdx : -1
+}
+
+export function nodePathToCoords(nodeIds: string[]): { lat: number; lng: number }[] {
+  return nodeIds.map(id => {
+    const c = nodeCoords[id]
+    return c ? { lat: c.lat, lng: c.lng } : null
+  }).filter((c): c is { lat: number; lng: number } => c !== null)
+}
+
+export function validatePathCoords(coords: { lat: number; lng: number }[]): boolean {
+  for (const c of coords) {
+    const key = `${c.lat},${c.lng}`
+    if (!geoCoordSet.has(key)) {
+      console.warn(`[CampusGraph] Non-GeoJSON coordinate: ${key}`)
+      return false
     }
   }
-  permute([], arr)
+  return true
+}
+
+export function validatePathEdges(nodePath: string[]): boolean {
+  for (let i = 0; i < nodePath.length - 1; i++) {
+    const a = nodePath[i]
+    const b = nodePath[i + 1]
+    const key = a < b ? `${a}-${b}` : `${b}-${a}`
+    if (!edgeLookup.has(key)) {
+      console.warn(`[CampusGraph] Edge not found: ${key}`)
+      return false
+    }
+  }
+  return true
+}
+
+export function getComponentsTraversed(nodePath: string[], comps: string[][]): number {
+  const visitedComps = new Set<number>()
+  for (const id of nodePath) {
+    for (let i = 0; i < comps.length; i++) {
+      if (comps[i].includes(id)) {
+        visitedComps.add(i)
+        break
+      }
+    }
+  }
+  return visitedComps.size
+}
+
+export function getBearing(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const dLng = ((lng2 - lng1) * Math.PI) / 180
+  const φ1 = (lat1 * Math.PI) / 180
+  const φ2 = (lat2 * Math.PI) / 180
+  const y = Math.sin(dLng) * Math.cos(φ2)
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(dLng)
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360
+}
+
+export function projectPointOnSegment(
+  lat: number, lng: number,
+  aLat: number, aLng: number,
+  bLat: number, bLng: number
+): { lat: number; lng: number; distance: number; t: number } {
+  const dx = bLng - aLng
+  const dy = bLat - aLat
+  const lengthSq = dx * dx + dy * dy
+  if (lengthSq < 1e-20) {
+    const dist = getHaversineDistance(lat, lng, aLat, aLng)
+    return { lat: aLat, lng: aLng, distance: dist, t: 0 }
+  }
+  let t = ((lng - aLng) * dx + (lat - aLat) * dy) / lengthSq
+  t = Math.max(0, Math.min(1, t))
+  const pLat = aLat + t * dy
+  const pLng = aLng + t * dx
+  const dist = getHaversineDistance(lat, lng, pLat, pLng)
+  return { lat: pLat, lng: pLng, distance: dist, t }
+}
+
+export interface NearbyEdge {
+  fromId: string
+  toId: string
+  projectedLat: number
+  projectedLng: number
+  distance: number
+  t: number
+  featureIdx: number
+  edgeCost: number
+}
+
+export function findNearbyEdges(lat: number, lng: number, maxDistance: number): NearbyEdge[] {
+  const results: NearbyEdge[] = []
+  for (const edge of EDGES) {
+    const a = nodeCoords[edge.from]
+    const b = nodeCoords[edge.to]
+    if (!a || !b) continue
+    const proj = projectPointOnSegment(lat, lng, a.lat, a.lng, b.lat, b.lng)
+    if (proj.distance <= maxDistance) {
+      results.push({
+        fromId: edge.from,
+        toId: edge.to,
+        projectedLat: proj.lat,
+        projectedLng: proj.lng,
+        distance: proj.distance,
+        t: proj.t,
+        featureIdx: edge.featureIdx,
+        edgeCost: edge.cost,
+      })
+    }
+  }
+  results.sort((a, b) => a.distance - b.distance)
   return results
 }
 
-export function getOptimalRoute(
-  shuttleLat: number,
-  shuttleLng: number,
-  targetStationIds: string[]
-): string[] {
-  if (targetStationIds.length === 0) return []
+export function findNearestEdge(lat: number, lng: number): {
+  fromId: string
+  toId: string
+  projectedLat: number
+  projectedLng: number
+  distance: number
+  t: number
+} | null {
+  let best: {
+    fromId: string
+    toId: string
+    projectedLat: number
+    projectedLng: number
+    distance: number
+    t: number
+  } | null = null
+  let minDist = Infinity
 
-  const startNode = getNearestNode(shuttleLat, shuttleLng)
-  const startId = startNode.id
-
-  if (targetStationIds.length <= 7) {
-    const pathCache: Record<string, { path: string[]; cost: number }> = {}
-    const getPathCached = (from: string, to: string) => {
-      const cacheKey = `${from}->${to}`
-      if (pathCache[cacheKey]) return pathCache[cacheKey]
-      const res = aStar(from, to)
-      pathCache[cacheKey] = res
-      return res
-    }
-
-    const permutations = getPermutations(targetStationIds)
-    let bestPerm: string[] = []
-    let minTotalCost = Infinity
-
-    for (const perm of permutations) {
-      let current = startId
-      let totalCost = 0
-      for (const target of perm) {
-        const { cost } = getPathCached(current, target)
-        totalCost += cost
-        current = target
-      }
-      if (totalCost < minTotalCost) {
-        minTotalCost = totalCost
-        bestPerm = perm
+  for (const edge of EDGES) {
+    const a = nodeCoords[edge.from]
+    const b = nodeCoords[edge.to]
+    if (!a || !b) continue
+    const proj = projectPointOnSegment(lat, lng, a.lat, a.lng, b.lat, b.lng)
+    if (proj.distance < minDist) {
+      minDist = proj.distance
+      best = {
+        fromId: edge.from,
+        toId: edge.to,
+        projectedLat: proj.lat,
+        projectedLng: proj.lng,
+        distance: proj.distance,
+        t: proj.t,
       }
     }
-
-    if (minTotalCost < Infinity) {
-      const fullPath: string[] = [startId]
-      let current = startId
-      for (const target of bestPerm) {
-        const { path } = getPathCached(current, target)
-        for (let i = 1; i < path.length; i++) {
-          fullPath.push(path[i])
-        }
-        current = target
-      }
-      return fullPath
-    }
   }
 
-  // Fallback to greedy (for N > 7, or if no connected route is found in permutation solver)
-  let currentId = startId
-  const remaining = new Set(targetStationIds)
-  const fullPath: string[] = [currentId]
-
-  while (remaining.size > 0) {
-    let nearestId = ''
-    let shortestPathToNearest: string[] = []
-    let minCost = Infinity
-
-    for (const targetId of remaining) {
-      const { path, cost } = aStar(currentId, targetId)
-      if (cost < minCost) {
-        minCost = cost
-        nearestId = targetId
-        shortestPathToNearest = path
-      }
-    }
-
-    if (nearestId === '') {
-      break
-    }
-
-    for (let i = 1; i < shortestPathToNearest.length; i++) {
-      fullPath.push(shortestPathToNearest[i])
-    }
-
-    remaining.delete(nearestId)
-    currentId = nearestId
-  }
-
-  return fullPath
-}
-
-import { ROAD_GEOMETRY } from './edge-geometry'
-
-export function getPathLength(points: [number, number][]): number {
-  let length = 0
-  for (let i = 0; i < points.length - 1; i++) {
-    length += getHaversineDistance(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1])
-  }
-  return length
-}
-
-export function getEdgeGeometry(fromId: string, toId: string): [number, number][] {
-  const key1 = `${fromId}-${toId}`
-  let geom = ROAD_GEOMETRY[key1]
-  
-  if (!geom) {
-    const key2 = `${toId}-${fromId}`
-    // Reversed geometry is only used for bidirectional roads. If this edge is one-way, add both directional keys explicitly in ROAD_GEOMETRY.
-    if (ROAD_GEOMETRY[key2]) {
-      geom = [...ROAD_GEOMETRY[key2]].reverse()
-    }
-  }
-
-  if (geom && geom.length > 0) {
-    return geom
-  }
-
-  throw new Error(`Missing ROAD_GEOMETRY for edge '${fromId}-${toId}'. Add OSM coordinates for this road segment.`)
-}
-
-export interface CampusRoutePoint {
-  id: string
-  name: string
-  lat: number
-  lng: number
-}
-
-export interface CampusRouteResult {
-  path: CampusRoutePoint[]
-  pathWithCoords: { lat: number; lng: number }[]
-  cost: number
-  source: 'Internal Graph'
-}
-
-/**
- * Build a campus route through sequential graph waypoints using internal road
- * geometry only (never OSRM/public driving roads).
- */
-export function buildCampusRoute(waypointIds: string[]): CampusRouteResult {
-  if (waypointIds.length < 2) {
-    return { path: [], pathWithCoords: [], cost: 0, source: 'Internal Graph' }
-  }
-
-  const fullPathDetails: CampusRoutePoint[] = []
-  let totalCost = 0
-
-  for (let i = 0; i < waypointIds.length - 1; i++) {
-    const segStartId = waypointIds[i]
-    const segGoalId = waypointIds[i + 1]
-    if (segStartId === segGoalId) continue
-
-    const { path: localNodeIds, cost: localCost } = aStar(segStartId, segGoalId)
-    if (!localNodeIds.length) {
-      throw new Error(`No internal campus path found between ${segStartId} and ${segGoalId}`)
-    }
-
-    const detailedPoints = buildDetailedPath(localNodeIds)
-    const segmentPath = detailedPoints.map((pt, index) => ({
-      id:
-        index === 0
-          ? segStartId
-          : index === detailedPoints.length - 1
-            ? segGoalId
-            : `road_point_${segStartId}_${segGoalId}_${index}`,
-      name:
-        index === 0
-          ? STATIONS.find((s) => s.id === segStartId)?.name || segStartId
-          : index === detailedPoints.length - 1
-            ? STATIONS.find((s) => s.id === segGoalId)?.name || segGoalId
-            : '',
-      lat: pt.lat,
-      lng: pt.lng,
-    }))
-
-    if (fullPathDetails.length > 0 && segmentPath.length > 0) {
-      fullPathDetails.push(...segmentPath.slice(1))
-    } else {
-      fullPathDetails.push(...segmentPath)
-    }
-    totalCost += localCost
-  }
-
-  const coordsForValidation = fullPathDetails.map(pt => [pt.lat, pt.lng] as [number, number])
-  if (!isRouteInsideCampus(coordsForValidation)) {
-    if (process.env.NODE_ENV === 'development') {
-      const outside = coordsForValidation.filter(([lat, lng]) => !isInsideCampus(lat, lng))
-      console.warn('[buildCampusRoute] Points outside boundary:', outside.slice(0, 5))
-    }
-    throw new Error('Route exits campus boundary. Check CAMPUS_BOUNDARY polygon or road geometry.')
-  }
-
-  return {
-    path: fullPathDetails,
-    pathWithCoords: fullPathDetails.map((pt) => ({ lat: pt.lat, lng: pt.lng })),
-    cost: totalCost,
-    source: 'Internal Graph',
-  }
-}
-
-export function buildDetailedPath(nodeIds: string[]): { lat: number, lng: number }[] {
-  if (nodeIds.length === 0) return []
-  if (nodeIds.length === 1) {
-    const node = STATIONS.find(s => s.id === nodeIds[0])
-    return node ? [{ lat: node.lat, lng: node.lng }] : []
-  }
-
-  const detailedPath: { lat: number, lng: number }[] = []
-  
-  for (let i = 0; i < nodeIds.length - 1; i++) {
-    const fromId = nodeIds[i]
-    const toId = nodeIds[i + 1]
-    const geom = getEdgeGeometry(fromId, toId)
-
-    if (i < nodeIds.length - 2) {
-      const nextFromId = nodeIds[i + 1]
-      const nextToId = nodeIds[i + 2]
-      const nextGeom = getEdgeGeometry(nextFromId, nextToId)
-      
-      const lastPoint = geom[geom.length - 1]
-      const nextFirstPoint = nextGeom[0]
-      if (lastPoint && nextFirstPoint) {
-        const latDiff = Math.abs(lastPoint[0] - nextFirstPoint[0])
-        const lngDiff = Math.abs(lastPoint[1] - nextFirstPoint[1])
-        if (latDiff > 0.0001 || lngDiff > 0.0001) {
-          console.warn(`[buildDetailedPath] Junction gap detected between ${fromId} and ${toId} — check geometry continuity`)
-        }
-      }
-    }
-    
-    // To prevent duplicate coordinates at intersections, we skip the last point 
-    // of each segment except for the very last segment in the entire route.
-    const isLastSegment = i === nodeIds.length - 2
-    for (let j = 0; j < geom.length; j++) {
-      if (!isLastSegment && j === geom.length - 1) {
-        continue // skip end point to avoid duplicate with next segment start
-      }
-      detailedPath.push({ lat: geom[j][0], lng: geom[j][1] })
-    }
-  }
-
-  return detailedPath
-}
-
-// ─── Campus Boundary (Assiut University geo-fence) ─────────────────────
-// Polygon covering the entire university campus, traced from station
-// coordinates and road geometry. Used to validate that shuttle routes
-// remain inside campus.
-
-export const CAMPUS_BOUNDARY: [number, number][] = [
-  [27.18245, 31.159699],  // SW
-  [27.18245, 31.1701825],  // S mid
-  [27.18245, 31.180666],  // SE
-  [27.187984, 31.180666],  // E mid
-  [27.193518, 31.180666],  // NE
-  [27.193518, 31.1701825],  // N mid
-  [27.193518, 31.159699],  // NW
-  [27.187984, 31.159699],  // W mid
-  [27.18245, 31.159699],  // close (= SW)
-]
-
-/**
- * Ray-casting point-in-polygon test.
- * Returns true if the point (lat, lng) is inside the campus boundary.
- */
-export function isInsideCampus(lat: number, lng: number): boolean {
-  const poly = CAMPUS_BOUNDARY
-  let inside = false
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const yi = poly[i][0], xi = poly[i][1]
-    const yj = poly[j][0], xj = poly[j][1]
-    const intersect =
-      yi > lat !== yj > lat &&
-      lng < ((xj - xi) * (lat - yi)) / (yj - yi) + xi
-    if (intersect) inside = !inside
-  }
-  return inside
-}
-
-/**
- * Validates that ALL points in a polyline are inside the campus boundary.
- * Returns true if the entire route is inside campus.
- */
-export function isRouteInsideCampus(points: [number, number][]): boolean {
-  // Allow small tolerance: at least 95% of points must be inside
-  if (points.length === 0) return true
-  let outsideCount = 0
-  for (const [lat, lng] of points) {
-    if (!isInsideCampus(lat, lng)) {
-      outsideCount++
-    }
-  }
-  // If more than 5% of points are outside, reject the route
-  const outsideRatio = outsideCount / points.length
-  return outsideRatio <= 0.05
-}
-
-function deriveCampusBoundsFromGeometry() {
-  let minLat = Infinity;
-  let maxLat = -Infinity;
-  let minLng = Infinity;
-  let maxLng = -Infinity;
-
-  for (const key in ROAD_GEOMETRY) {
-    const coords = ROAD_GEOMETRY[key];
-    for (const [lat, lng] of coords) {
-      if (lat < minLat) minLat = lat;
-      if (lat > maxLat) maxLat = lat;
-      if (lng < minLng) minLng = lng;
-      if (lng > maxLng) maxLng = lng;
-    }
-  }
-
-  minLat -= 0.0005;
-  maxLat += 0.0005;
-  minLng -= 0.0005;
-  maxLng += 0.0005;
-
-  console.log('[Campus Bounds]', { minLat, maxLat, minLng, maxLng });
-}
-
-if (process.env.NODE_ENV === 'development') {
-  deriveCampusBoundsFromGeometry();
+  return best
 }

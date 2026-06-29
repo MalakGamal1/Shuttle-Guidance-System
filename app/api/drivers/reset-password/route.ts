@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { adminAuth } from '@/lib/firebase-admin'
+import { adminAuth, verifyAdmin } from '@/lib/firebase-admin'
 
 /**
  * POST /api/drivers/reset-password
@@ -10,6 +10,12 @@ import { adminAuth } from '@/lib/firebase-admin'
  */
 export async function POST(req: NextRequest) {
     try {
+        try {
+            await verifyAdmin(req)
+        } catch (authErr: any) {
+            return NextResponse.json({ error: authErr.message || 'Unauthorized' }, { status: 401 })
+        }
+
         if (!adminAuth) {
             return NextResponse.json(
                 { error: 'Firebase Admin SDK is not initialized.' },

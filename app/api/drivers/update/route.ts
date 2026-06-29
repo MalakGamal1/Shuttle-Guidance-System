@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { adminAuth, adminApp } from '@/lib/firebase-admin'
+import { adminAuth, adminApp, verifyAdmin } from '@/lib/firebase-admin'
 import { getFirestore, FieldValue } from 'firebase-admin/firestore'
 
 /**
@@ -21,6 +21,12 @@ import { getFirestore, FieldValue } from 'firebase-admin/firestore'
  */
 export async function PUT(req: NextRequest) {
     try {
+        try {
+            await verifyAdmin(req)
+        } catch (authErr: any) {
+            return NextResponse.json({ error: authErr.message || 'Unauthorized' }, { status: 401 })
+        }
+
         if (!adminAuth || !adminApp) {
             return NextResponse.json(
                 { error: 'Firebase Admin SDK is not initialized.' },

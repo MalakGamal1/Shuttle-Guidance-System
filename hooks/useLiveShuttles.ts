@@ -8,10 +8,10 @@ import { db } from '@/lib/firebase'
 //  Types
 // ─────────────────────────────────────────────────────────────
 export interface LiveShuttle {
-  user_id:    string // Shuttle Document ID
+  user_id:    string
   lat:        number
   lng:        number
-  updated_at: string // ISO Timestamp string
+  updated_at: string
   plateNumber: string
   driverName: string
   status:     string
@@ -40,7 +40,7 @@ export function useLiveShuttles(intervalMs?: number) {
     const mergeAndSet = () => {
       const merged: LiveShuttle[] = rawShuttles
         .map((shuttle) => {
-          if (!shuttle.lastLocation || shuttle.lastLocation.lat == null || shuttle.lastLocation.lng == null) {
+          if (shuttle.lat == null || shuttle.lng == null) {
             return null
           }
 
@@ -50,16 +50,16 @@ export function useLiveShuttles(intervalMs?: number) {
 
           // Get last location timestamp
           let updated_at = new Date().toISOString()
-          if (shuttle.lastLocation.updatedAt) {
-            const ut = shuttle.lastLocation.updatedAt
-            const date = ut.toDate ? ut.toDate() : new Date(ut)
+          const ts = shuttle.updatedAt ?? shuttle.lastUpdated
+          if (ts) {
+            const date = ts.toDate ? ts.toDate() : new Date(ts)
             updated_at = date.toISOString()
           }
 
           return {
             user_id: shuttle.id,
-            lat: shuttle.lastLocation.lat,
-            lng: shuttle.lastLocation.lng,
+            lat: shuttle.lat,
+            lng: shuttle.lng,
             updated_at,
             plateNumber: shuttle.plateNumber || 'Unknown',
             driverName,
